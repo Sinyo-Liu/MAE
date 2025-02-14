@@ -13,6 +13,9 @@ import random
 from utils.knn import knn_point
 from extensions.chamfer_dist import ChamferDistanceL1, ChamferDistanceL2
 from models.pos import get_pos_embed
+from torch_scatter import scatter
+import clip
+
 
 
 class Encoder(nn.Module):   ## Embedding module
@@ -318,6 +321,50 @@ class TransformerDecoder(nn.Module):
         return x
 
 
+
+class TransformerCrossDecoder(nn.Module):
+    def __init__(self, embed_dim=384, depth=4, num_heads=6, mlp_ratio=4., qkv_bias=False, qk_scale=None,
+                 drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1, norm_layer=nn.LayerNorm):
+        super().__init__()
+        self.blocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                drop=drop_rate, attn_drop=attn_drop_rate,
+                drop_path=drop_path_rate[i] if isinstance(drop_path_rate, list) else drop_path_rate
+            )
+            for i in range(depth)])
+        self.norm = norm_layer(embed_dim)
+        self.head = nn.Identity()
+
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.xavier_uniform_(m.weight)
+            if isinstance(m, nn.Linear) and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def forward(self, x, y, pos=None, return_token_num=None):
+        if pos is None:
+            # pred pos decoder
+            for _, block in enumerate(self.blocks):
+                x, _ = block(x, y)
+                # x = block(x)
+            x = self.head(self.norm(x))
+            return x         
+        for _, block in enumerate(self.blocks):
+            # x = block(x + pos)
+            x, _ = block(x + pos, y)
+
+        x = self.head(self.norm(x[:, -return_token_num:]))  # only return the mask tokens predict pixel
+        return x
+
+
+
+
 # Pretrain model
 class MaskTransformer(nn.Module):
     def __init__(self, config, **kwargs):
@@ -476,6 +523,14 @@ class PCP_MAE(nn.Module):
             num_heads=self.decoder_num_heads,
         )
 
+        self.MAE_Cross_decoder = TransformerCrossDecoder(
+            embed_dim=self.trans_dim,
+            depth=self.decoder_depth,
+            drop_path_rate=dpr,
+            num_heads=self.decoder_num_heads,
+        )
+
+
         print_log(f'[PCP_MAE] divide point cloud into G{self.num_group} x S{self.group_size} points ...', logger ='PCP_MAE')
         self.group_divider = Group(num_group = self.num_group, group_size = self.group_size)
 
@@ -487,16 +542,29 @@ class PCP_MAE(nn.Module):
             nn.Conv1d(self.trans_dim, 3*self.group_size, 1)
         )
 
+        self.increase_cross_dim = nn.Sequential(
+            # nn.Conv1d(self.trans_dim, 1024, 1),
+            # nn.BatchNorm1d(1024),
+            # nn.LeakyReLU(negative_slope=0.2),
+            nn.Conv1d(self.trans_dim, 3*self.group_size, 1)
+        )
+
         trunc_normal_(self.mask_token, std=.02)
         self.loss = config.loss
         # loss
         self.build_loss_func(self.loss)
         
+        # self.pred_pos_proj = nn.Sequential( # input B, M, C  
+        #     nn.Linear(self.trans_dim, self.trans_dim),
+        #     nn.LayerNorm(self.trans_dim),
+        #     nn.ReLU(inplace=True),
+        #     nn.Linear(self.trans_dim, self.trans_dim),
+        # )
         self.pred_pos_proj = nn.Sequential( # input B, M, C  
-            nn.Linear(self.trans_dim, self.trans_dim),
-            nn.LayerNorm(self.trans_dim),
+            nn.Linear(self.trans_dim, 512),
+            nn.LayerNorm(512),
             nn.ReLU(inplace=True),
-            nn.Linear(self.trans_dim, self.trans_dim),
+            nn.Linear(512, 512),
         )  
         
         self.pred_loss = config.pred_loss
@@ -511,6 +579,78 @@ class PCP_MAE(nn.Module):
         
         self.add_detach = config.add_detach
 
+        # 2D pre-trained models, clip by default
+        self.clip_model, _ = clip.load(config.clip_config.visual_encoder)
+        self.clip_model.eval()
+
+        # multi-view projection
+        self.img_mean = torch.Tensor([0.485, 0.456, 0.406])
+        self.img_std = torch.Tensor([0.229, 0.224, 0.225])
+        self.img_size = 224
+        self.img_offset = torch.Tensor([[-2, -2], [-2, -1], [-2, 0], [-2, 1], [-2, 2], 
+                                        [-1, -2], [-1, -1], [-1, 0], [-1, 1], [-1, 2], 
+                                        [0, -2], [0, -1], [0, 0], [0, 1], [0, 2],
+                                        [1, -2], [1, -1], [1, 0], [1, 1], [1, 2],
+                                        [2, -2], [2, -1], [2, 0], [2, 1], [2, 2]])
+        self.proj_reduction = 'sum'
+
+    ''' Efficient Projection '''
+    def proj2img(self, pc):
+        B, N, _ = pc.shape
+        
+        # calculate range
+        pc_range = pc.max(dim=1)[0] - pc.min(dim=1)[0]  # B 3
+        grid_size = pc_range[:, :2].max(dim=-1)[0] / (self.img_size - 3)  # B,
+
+        # Point Index
+        pc_min = pc.min(dim=1)[0][:, :2].unsqueeze(dim=1)
+        grid_size = grid_size.unsqueeze(dim=1).unsqueeze(dim=2)
+        idx_xy = torch.floor((pc[:, :, :2] - pc_min) / grid_size)  # B N 2
+        
+        # Point Densify
+        idx_xy_dense = (idx_xy.unsqueeze(dim=2) + self.img_offset.unsqueeze(dim=0).unsqueeze(dim=0).to(pc.device)).view(idx_xy.size(0), N*25, 2) + 1
+        # B N 1 2 + 1 1 9 2 -> B N 9 2 -> B 9N 2
+        
+        # Object to Image Center
+        idx_xy_dense_center = torch.floor((idx_xy_dense.max(dim=1)[0] + idx_xy_dense.min(dim=1)[0]) / 2).int()
+        offset_x = self.img_size / 2 - idx_xy_dense_center[:, 0: 1] - 1
+        offset_y = self.img_size / 2 - idx_xy_dense_center[:, 1: 2] - 1
+        idx_xy_dense_offset = idx_xy_dense + torch.cat([offset_x, offset_y], dim=1).unsqueeze(dim=1)
+
+        # Expand Point Features
+        f_dense = pc.unsqueeze(dim=2).expand(-1, -1, 25, -1).contiguous().view(pc.size(0), N * 25, 3)[..., 2: 3].repeat(1, 1, 3)
+        
+        idx_zero = idx_xy_dense_offset < 0
+        idx_obj = idx_xy_dense_offset > 223
+        idx_xy_dense_offset = idx_xy_dense_offset + idx_zero.to(torch.int32)
+        idx_xy_dense_offset = idx_xy_dense_offset - idx_obj.to(torch.int32)
+
+        # B N 9 C -> B 9N C
+        assert idx_xy_dense_offset.min() >= 0 and idx_xy_dense_offset.max() <= (self.img_size-1), str(idx_xy_dense_offset.min()) + '-' + str(idx_xy_dense_offset.max())
+        
+        # change idx to 1-dim
+        new_idx_xy_dense = idx_xy_dense_offset[:, :, 0] * self.img_size + idx_xy_dense_offset[:, :, 1]
+        
+        # Get Image Features
+        out = scatter(f_dense, new_idx_xy_dense.long(), dim=1, reduce=self.proj_reduction) 
+
+        # need to pad 
+        if out.size(1) < self.img_size * self.img_size: 
+            delta = self.img_size * self.img_size - out.size(1) 
+            zero_pad = torch.zeros(out.size(0), delta, out.size(2)).to(out.device) 
+            res = torch.cat([out, zero_pad], dim=1).reshape((out.size(0), self.img_size, self.img_size, out.size(2))) 
+        else: 
+            res = out.reshape((out.size(0), self.img_size, self.img_size, out.size(2))) 
+        
+        # B 224 224 C
+        img = res.permute(0, 3, 1, 2).contiguous()
+        mean_vec = self.img_mean.unsqueeze(dim=0).unsqueeze(dim=2).unsqueeze(dim=3).cuda()  # 1 3 1 1
+        std_vec = self.img_std.unsqueeze(dim=0).unsqueeze(dim=2).unsqueeze(dim=3).cuda()   # 1 3 1 1
+        # Normalize the pic        
+        img = nn.Sigmoid()(img)
+        img_norm = img.sub(mean_vec).div(std_vec)
+        return img_norm, pc_min, grid_size, (offset_x, offset_y)
+
     def build_loss_func(self, loss_type):
         if loss_type == "cdl1":
             self.loss_func = ChamferDistanceL1().cuda()
@@ -520,53 +660,96 @@ class PCP_MAE(nn.Module):
             raise NotImplementedError
             # self.loss_func = emd().cuda()
 
-
     def forward(self, pts, vis = False, **kwargs):
         neighborhood, center = self.group_divider(pts)
 
+        '''Encoder'''
         x_vis, x_mask_without_pos, mask = self.MAE_encoder(neighborhood, center)
         B,_,C = x_vis.shape # B VIS C
+        mask_pts = neighborhood[mask].reshape(B,-1,3)
+
+        imgs_mask, pc_min_mask, grid_size_mask, offsets_mask = self.proj2img(mask_pts)  # b, 3, 224, 224
+        with torch.no_grad():
+    
+            # ''' 2D Attention Maps '''
+            # img_feats, img_sals = self.clip_model.encode_image(imgs_mask)  # b, c, h, w
+            # img_sals = img_sals.float()[:, 0, 1:]  # b, 196
+            # img_sals = img_sals.reshape(-1, 1, 14, 14)  # b, 1, 14, 14
+
+            ''' 2D Representations Extraction '''
+            img_feats = self.clip_model.encode_image(imgs_mask)  # b, c, h, w
+
+            ''' 2D Visual Features '''
+            img_feats = img_feats.float()
+
+
+            
+        pot_rec = self.pred_pos_proj(x_mask_without_pos) # B, Mask, C -> B, Mask, C
+        tmp_img_feats = F.normalize(img_feats.detach(), dim=-1)
+        tmp_pot_rec = F.normalize(pot_rec.mean(1), dim=-1)
+        # loss2 = 1 - (tmp_img_feats * tmp_pot_rec).sum(dim=-1).mean()
+        cos_sim = torch.sum(tmp_img_feats * tmp_pot_rec, dim=-1) / (torch.norm(tmp_img_feats, p=2, dim=-1) * 
+                                                                    torch.norm(tmp_pot_rec, p=2, dim=-1))
+        loss2 = 1 - cos_sim.mean()
+
+        # if self.config.pred_pos_transformer_layer != 0:
+        #     x_mask_without_pos = self.pred_pos_decoder(x_mask_without_pos)
         
-        if self.config.pred_pos_transformer_layer != 0:
-            x_mask_without_pos = self.pred_pos_decoder(x_mask_without_pos)
-        
-        pos_rec = self.pred_pos_proj(x_mask_without_pos) # B, Mask, C -> B, Mask, C
-        gt_pos = get_pos_embed(self.trans_dim, center[mask].reshape(B, -1, 3))
-        if self.pred_loss == 'l2':
-            loss2 = F.mse_loss(pos_rec, gt_pos.detach())    
-        elif self.pred_loss == 'sml1':
-            loss2 = torch.nn.SmoothL1Loss()(pos_rec, gt_pos.detach()).mean() 
-        elif self.pred_loss == 'cos':
-            # B, Mask, C
-            tmp_gt_pos = F.normalize(gt_pos.detach(), dim=-1)
-            tmp_pos_rec = F.normalize(pos_rec, dim=-1)
-            loss2 = 1 - (tmp_gt_pos * tmp_pos_rec).sum(dim=-1).mean()
-        elif self.pred_loss == 'l1':
-            loss2 = F.l1_loss(pos_rec, gt_pos.detach())
-        else:
-            raise NotImplementedError
+        # pos_rec = self.pred_pos_proj(x_mask_without_pos) # B, Mask, C -> B, Mask, C
+        # gt_pos = get_pos_embed(self.trans_dim, center[mask].reshape(B, -1, 3))
+        # if self.pred_loss == 'l2':
+        #     loss2 = F.mse_loss(pos_rec, gt_pos.detach())    
+        # elif self.pred_loss == 'sml1':
+        #     loss2 = torch.nn.SmoothL1Loss()(pos_rec, gt_pos.detach()).mean() 
+        # elif self.pred_loss == 'cos':
+        #     # B, Mask, C
+        #     tmp_gt_pos = F.normalize(gt_pos.detach(), dim=-1)
+        #     tmp_pos_rec = F.normalize(pos_rec, dim=-1)
+        #     loss2 = 1 - (tmp_gt_pos * tmp_pos_rec).sum(dim=-1).mean()
+        # elif self.pred_loss == 'l1':
+        #     loss2 = F.l1_loss(pos_rec, gt_pos.detach())
+        # else:
+        #     raise NotImplementedError
         
 
+        '''Self Points Decoder-Vis'''
         pos_emd_vis = self.MAE_encoder.pos_embed(get_pos_embed(self.trans_dim, center[~mask].reshape(B, -1, 3)))
+        pos_emd_mask = self.MAE_encoder.pos_embed(get_pos_embed(self.trans_dim, center[mask].reshape(B, -1, 3)))
         
-        if self.add_detach:
-            pos_rec = self.MAE_encoder.pos_embed(pos_rec.detach())      
-        else:
-            pos_rec = self.MAE_encoder.pos_embed(pos_rec)   
+        # if self.add_detach:
+            # pos_rec = self.MAE_encoder.pos_embed(pos_rec.detach())      
+        # else:
+            # pos_rec = self.MAE_encoder.pos_embed(pos_rec)   
 
-        _,N,_ = pos_rec.shape
+        
+
+        _,N,_ = pot_rec.shape
         mask_token = self.mask_token.expand(B, N, -1)
         x_full = torch.cat([x_vis, mask_token], dim=1)
         
-        pos_full = torch.cat([pos_emd_vis, pos_rec], dim=1)
+        # pos_full = torch.cat([pos_emd_vis, pos_rec], dim=1)
+        pos_full = torch.cat([pos_emd_vis, pos_emd_mask], dim=1)
 
-        x_rec = self.MAE_decoder(x_full, pos_full, N)
+        x_rec = self.MAE_decoder(x=x_full, pos=pos_full, return_token_num=N)
 
         B, M, C = x_rec.shape
         rebuild_points = self.increase_dim(x_rec.transpose(1, 2)).transpose(1, 2).reshape(B * M, -1, 3)  # B M 1024
 
         gt_points = neighborhood[mask].reshape(B * M,-1,3)
         loss1 = self.loss_func(rebuild_points, gt_points)
+
+
+
+        '''Cross Center Decoder-Mask'''
+        # cross_mask_full = pot_rec.detach()
+        # x_cross_rec = self.MAE_Cross_decoder(x=x_full, y=cross_mask_full, pos=pos_full, return_token_num=N)
+        # rebuild_cross_points = self.increase_cross_dim(x_cross_rec.transpose(1, 2)).transpose(1, 2).reshape(B * M, -1, 3)  # B M 1024
+
+        # loss3 = self.loss_func(rebuild_cross_points, gt_points)
+
+
+
+
         
         if vis: #visualization
             vis_points = neighborhood[~mask].reshape(B * (self.num_group - M), -1, 3)
@@ -582,6 +765,7 @@ class PCP_MAE(nn.Module):
             return ret1, ret2, full_center
         else:
             return loss1, self.config.ita * loss2
+            # return loss1, self.config.ita * loss2, loss3
 
 # finetune model
 @MODELS.register_module()

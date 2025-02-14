@@ -53,11 +53,11 @@ def build_opti_sche(base_model, config):
     decay = []
     no_decay = []
     finetune_head = []
-    print('trainable parameters: ')
+    # print('trainable parameters: ')
     for name, param in base_model.module.named_parameters():
         if not param.requires_grad:
             continue  # frozen weights
-        print(name)
+        # print(name)
         if 'cls' in name and config.model.NAME == 'PointTransformer':   
             print("10 * LR: ", name)       
             finetune_head.append(param)

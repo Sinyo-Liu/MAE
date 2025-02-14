@@ -14,11 +14,11 @@ scheduler: {
 
 dataset : {
   train : { _base_: cfgs/dataset_configs/ShapeNet-55.yaml,
-            others: {subset: 'train', npoints: 1024}},
+            others: {subset: 'train', npoints: 2048}},
   val : { _base_: cfgs/dataset_configs/ShapeNet-55.yaml,
-            others: {subset: 'test', npoints: 1024}},
+            others: {subset: 'test', npoints: 2048}},
   test : { _base_: cfgs/dataset_configs/ShapeNet-55.yaml,
-            others: {subset: 'test', npoints: 1024}}}
+            others: {subset: 'test', npoints: 2048}}}
 
 model : {
   NAME: PCP_MAE,
@@ -43,9 +43,14 @@ model : {
     decoder_depth: 4,
     decoder_num_heads: 6,
   },
+
+  clip_config: {
+    visual_encoder: 'ViT-B/16',
+    feat_dim: 9984
+  },
   }
 
-npoints: 1024
+npoints: 2048
 total_bs : 128
 step_per_update : 1
 max_epoch : 300
